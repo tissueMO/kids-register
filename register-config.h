@@ -58,6 +58,6 @@ static constexpr ToneStep STARTUP_TONE_STEPS[] = {
 /**
  * スピーカー音量です。
  */
-static constexpr uint8_t SPEAKER_VOLUME = 96;
+static constexpr uint8_t SPEAKER_VOLUME = 32;
 
 #endif

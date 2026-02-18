@@ -1,4 +1,6 @@
 #include <M5Unified.h>
+#include <MFRC522_I2C.h>
+#include <Wire.h>
 
 #include <algorithm>
 #include <vector>
@@ -8,14 +10,20 @@
 namespace {
 
 // バーコードスキャナUART設定
-constexpr int BARCODE_RX_PIN = 18;
-constexpr int BARCODE_TX_PIN = 17;
-constexpr long BARCODE_BAUD = 9600;
+constexpr long BARCODE_BAUD_CANDIDATES[] = {9600, 115200, 19200, 38400, 57600};
+constexpr bool BARCODE_START_WITH_SWAPPED_LINES = false;
+constexpr uint32_t BARCODE_FRAME_GAP_MS = 300;
+constexpr int BARCODE_SHORT_FRAME_RETRY_THRESHOLD = 5;
+constexpr uint32_t BARCODE_PROBE_INTERVAL_MS = 4000;
 
-// RFIDリーダUART設定
-constexpr int RFID_RX_PIN = 14;
-constexpr int RFID_TX_PIN = 13;
-constexpr long RFID_BAUD = 9600;
+// RFIDリーダI2C設定
+constexpr uint8_t RFID_I2C_ADDRESS = 0x28;
+constexpr uint32_t RFID_I2C_CLOCK = 100000;
+constexpr int RFID_RESET_DUMMY_PIN = 8;
+constexpr uint32_t DEBUG_FRAME_GAP_MS = 0;
+
+// デバッグ設定
+constexpr bool ENABLE_SERIAL_DEBUG = true;
 
 // 画面遷移タイミング
 constexpr uint32_t THANK_YOU_DURATION_MS = 3000;
@@ -27,10 +35,17 @@ constexpr int PRICE_STEP = 10;
 constexpr int PRICE_LEVELS = 46;
 
 // 画面レイアウト設定
-constexpr int CLEAR_BUTTON_X = 214;
-constexpr int CLEAR_BUTTON_Y = 6;
-constexpr int CLEAR_BUTTON_W = 100;
-constexpr int CLEAR_BUTTON_H = 40;
+constexpr int CLEAR_BUTTON_MARGIN_RIGHT = 8;
+constexpr int CLEAR_BUTTON_MARGIN_BOTTOM = 8;
+constexpr int CLEAR_BUTTON_W = 84;
+constexpr int CLEAR_BUTTON_H = 34;
+constexpr int CLEAR_BUTTON_HIT_INSET = 2;
+constexpr int CAPTION_Y = 6;
+constexpr int LIST_START_Y = 57;
+constexpr int ITEM_ROW_HEIGHT = 36;
+constexpr int ITEM_TEXT_OFFSET_Y = 3;
+constexpr int ITEM_RULE_OFFSET_Y = 30;
+constexpr int SUMMARY_MARGIN_BOTTOM = 4;
 
 enum class AppState {
   NORMAL,
@@ -42,8 +57,15 @@ struct Item {
   int price;
 };
 
+struct Rect {
+  int x;
+  int y;
+  int w;
+  int h;
+};
+
 HardwareSerial barcodeSerial(1);
-HardwareSerial rfidSerial(2);
+MFRC522_I2C rfidReader(RFID_I2C_ADDRESS, RFID_RESET_DUMMY_PIN, &Wire);
 
 std::vector<Item> cart;
 AppState appState = AppState::NORMAL;
@@ -51,8 +73,173 @@ uint32_t thankYouStartedAtMs = 0;
 bool wasTouching = false;
 
 String barcodeBuffer;
-String rfidBuffer;
 String debugBuffer;
+uint32_t barcodeLastByteAtMs = 0;
+uint32_t debugLastByteAtMs = 0;
+uint32_t barcodeLastProbeAtMs = 0;
+int barcodePortcRxdPin = -1;
+int barcodePortcTxdPin = -1;
+int barcodeRxPin = -1;
+int barcodeTxPin = -1;
+size_t barcodeBaudIndex = 0;
+size_t barcodeConfigIndex = 0;
+int barcodeShortFrameCount = 0;
+bool barcodeUartLocked = false;
+
+constexpr const lgfx::U8g2font* BODY_FONT = &fonts::lgfxJapanGothic_24;
+constexpr const lgfx::U8g2font* SUMMARY_FONT = &fonts::lgfxJapanGothic_32;
+constexpr const lgfx::U8g2font* BUTTON_FONT = &fonts::lgfxJapanGothic_16;
+
+/**
+ * デバッグログをUSBシリアルへ出力します。
+ */
+void logDebug(const String& message) {
+  if (!ENABLE_SERIAL_DEBUG) {
+    return;
+  }
+
+  Serial.println(message);
+}
+
+/**
+ * RFIDリーダのI2C接続状態をログ出力します。
+ */
+void logRfidI2cStatus() {
+  Wire.beginTransmission(RFID_I2C_ADDRESS);
+  const uint8_t errorCode = Wire.endTransmission();
+
+  if (errorCode == 0) {
+    logDebug("[RFID] I2C address 0x28 detected");
+    return;
+  }
+
+  logDebug("[RFID] I2C address 0x28 not found, error=" + String(errorCode));
+}
+
+/**
+ * RFIDリーダのバージョンレジスタ値をログ出力します。
+ */
+void logRfidVersion() {
+  const uint8_t version = rfidReader.PCD_ReadRegister(rfidReader.VersionReg);
+  String text = "[RFID] version=0x";
+  if (version < 0x10) {
+    text += "0";
+  }
+  text += String(version, HEX);
+  text.toUpperCase();
+  logDebug(text);
+}
+
+/**
+ * バーコードボーレート候補数を返します。
+ */
+size_t getBarcodeBaudCount() {
+  return sizeof(BARCODE_BAUD_CANDIDATES) / sizeof(BARCODE_BAUD_CANDIDATES[0]);
+}
+
+/**
+ * 現在の候補インデックスのボーレートを返します。
+ */
+long getCurrentBarcodeBaud() {
+  return BARCODE_BAUD_CANDIDATES[barcodeBaudIndex];
+}
+
+/**
+ * 現在設定が配線入れ替え状態かを返します。
+ */
+bool isBarcodeSwapped() {
+  return barcodeRxPin == barcodePortcTxdPin && barcodeTxPin == barcodePortcRxdPin;
+}
+
+/**
+ * 指定した設定インデックスをUART設定へ反映します。
+ */
+void applyBarcodeSerialConfig(const size_t configIndex) {
+  const size_t baudCount = getBarcodeBaudCount();
+  const bool swapLines = configIndex / baudCount > 0;
+
+  barcodeConfigIndex = configIndex;
+  barcodeBaudIndex = configIndex % baudCount;
+  barcodeRxPin = swapLines ? barcodePortcTxdPin : barcodePortcRxdPin;
+  barcodeTxPin = swapLines ? barcodePortcRxdPin : barcodePortcTxdPin;
+}
+
+/**
+ * バーコードUARTを現在設定で初期化します。
+ */
+void beginBarcodeSerial(const bool shouldLog) {
+  barcodeSerial.begin(getCurrentBarcodeBaud(), SERIAL_8N1, barcodeRxPin, barcodeTxPin);
+
+  if (shouldLog) {
+    logDebug(
+      "[BC] serial begin RX=" + String(barcodeRxPin)
+      + " TX=" + String(barcodeTxPin)
+      + " BAUD=" + String(getCurrentBarcodeBaud())
+    );
+  }
+}
+
+/**
+ * バーコードUARTを次の候補ボーレートへ切り替えます。
+ */
+void rotateBarcodeBaud() {
+  const size_t baudCount = getBarcodeBaudCount();
+  const size_t swapBaseIndex = isBarcodeSwapped() ? baudCount : 0;
+  const size_t nextConfigIndex = swapBaseIndex + (barcodeBaudIndex + 1) % baudCount;
+
+  applyBarcodeSerialConfig(nextConfigIndex);
+  barcodeSerial.end();
+  beginBarcodeSerial(false);
+}
+
+/**
+ * バーコードUARTを次の配線/ボーレート候補へ切り替えます。
+ */
+void rotateBarcodeSerialConfig() {
+  const size_t totalCount = getBarcodeBaudCount() * 2;
+  const size_t nextConfigIndex = (barcodeConfigIndex + 1) % totalCount;
+
+  applyBarcodeSerialConfig(nextConfigIndex);
+  barcodeSerial.end();
+  beginBarcodeSerial(false);
+}
+
+/**
+ * 無受信時の探索として配線/ボーレート候補を巡回します。
+ */
+void probeBarcodeSerialWhenSilent() {
+  if (barcodeUartLocked) {
+    return;
+  }
+
+  if (millis() - barcodeLastProbeAtMs < BARCODE_PROBE_INTERVAL_MS) {
+    return;
+  }
+
+  barcodeLastProbeAtMs = millis();
+  rotateBarcodeSerialConfig();
+}
+
+/**
+ * CLEARボタンの表示領域を返します。
+ */
+Rect getClearButtonRect() {
+  const int x = M5.Display.width() - CLEAR_BUTTON_W - CLEAR_BUTTON_MARGIN_RIGHT;
+  const int y = M5.Display.height() - CLEAR_BUTTON_H - CLEAR_BUTTON_MARGIN_BOTTOM;
+  return Rect{x, y, CLEAR_BUTTON_W, CLEAR_BUTTON_H};
+}
+
+/**
+ * CLEARボタンのタッチ判定領域を返します。
+ */
+Rect getClearButtonHitRect() {
+  const Rect buttonRect = getClearButtonRect();
+  const int x = buttonRect.x + CLEAR_BUTTON_HIT_INSET;
+  const int y = buttonRect.y + CLEAR_BUTTON_HIT_INSET;
+  const int w = std::max(buttonRect.w - CLEAR_BUTTON_HIT_INSET * 2, 1);
+  const int h = std::max(buttonRect.h - CLEAR_BUTTON_HIT_INSET * 2, 1);
+  return Rect{x, y, w, h};
+}
 
 /**
  * 商品名候補数を返します。
@@ -218,54 +405,88 @@ void drawCenteredText(const String& text, const int y) {
 }
 
 /**
+ * 指定矩形の中央に文字列を描画します。
+ */
+void drawCenteredTextInRect(const String& text, const Rect& rect) {
+  const int x = rect.x + (rect.w - M5.Display.textWidth(text)) / 2;
+  const int y = rect.y + (rect.h - M5.Display.fontHeight()) / 2;
+  M5.Display.setCursor(std::max(x, 0), std::max(y, 0));
+  M5.Display.print(text);
+}
+
+/**
  * 通常画面を描画します。
  */
 void renderNormalScreen() {
-  const int displayHeight = M5.Display.height();
+  M5.Display.setFont(BODY_FONT);
+
   const int displayWidth = M5.Display.width();
-  const int lineMaxWidth = displayWidth - 24;
+  const int displayHeight = M5.Display.height();
+  const Rect clearButtonRect = getClearButtonRect();
 
   // 画面の固定要素を先に再描画
   M5.Display.fillScreen(TFT_WHITE);
   M5.Display.setTextColor(TFT_BLACK, TFT_WHITE);
-  M5.Display.setCursor(8, 8);
+  M5.Display.setCursor(8, CAPTION_Y);
   M5.Display.print("おうちレジ");
 
-  M5.Display.fillRoundRect(CLEAR_BUTTON_X, CLEAR_BUTTON_Y, CLEAR_BUTTON_W, CLEAR_BUTTON_H, 6, TFT_RED);
+  M5.Display.fillRoundRect(
+    clearButtonRect.x,
+    clearButtonRect.y,
+    clearButtonRect.w,
+    clearButtonRect.h,
+    6,
+    TFT_RED
+  );
+  M5.Display.setFont(BUTTON_FONT);
   M5.Display.setTextColor(TFT_WHITE, TFT_RED);
-  M5.Display.setCursor(CLEAR_BUTTON_X + 10, CLEAR_BUTTON_Y + 12);
-  M5.Display.print("CLEAR");
+  drawCenteredTextInRect("CLEAR", clearButtonRect);
+  M5.Display.setFont(BODY_FONT);
 
   M5.Display.setTextColor(TFT_BLACK, TFT_WHITE);
-  M5.Display.setCursor(8, 50);
-  M5.Display.print("明細");
 
-  // 最新側を優先して表示
-  const int firstIndex = static_cast<int>(cart.size()) > ITEM_VISIBLE_ROWS
-    ? static_cast<int>(cart.size()) - ITEM_VISIBLE_ROWS
-    : 0;
+  // 最新側を上から表示
+  const int lastIndex = static_cast<int>(cart.size()) - 1;
+  const int firstIndex = std::max(lastIndex - ITEM_VISIBLE_ROWS + 1, 0);
 
-  // 行幅超過時は末尾を省略
-  int rowY = 80;
-  for (int index = firstIndex; index < static_cast<int>(cart.size()); ++index) {
-    const String line = cart[index].name + "  " + String(cart[index].price) + "円";
-    const String displayLine = ellipsizeText(line, lineMaxWidth);
-    M5.Display.setCursor(12, rowY);
-    M5.Display.print(displayLine);
-    rowY += 30;
+  for (int rowIndex = 0; rowIndex < ITEM_VISIBLE_ROWS; ++rowIndex) {
+    const int ruleY = LIST_START_Y + rowIndex * ITEM_ROW_HEIGHT + ITEM_RULE_OFFSET_Y;
+    M5.Display.drawFastHLine(8, ruleY, displayWidth - 16, TFT_DARKGREY);
   }
 
-  const int totalCount = static_cast<int>(cart.size());
+  // 行幅超過時は末尾を省略
+  int rowY = LIST_START_Y;
+  for (int index = lastIndex; index >= firstIndex; --index) {
+    const String priceText = "￥" + String(cart[index].price);
+    const int priceX = std::max(displayWidth - 12 - M5.Display.textWidth(priceText), 12);
+    const int nameMaxWidth = std::max(priceX - 24, 0);
+    const String nameText = ellipsizeText(cart[index].name, nameMaxWidth);
+
+    M5.Display.setCursor(12, rowY + ITEM_TEXT_OFFSET_Y);
+    M5.Display.print(nameText);
+    M5.Display.setCursor(priceX, rowY + ITEM_TEXT_OFFSET_Y);
+    M5.Display.print(priceText);
+    rowY += ITEM_ROW_HEIGHT;
+  }
+
   const int totalSum = calculateTotalSum();
+  const String labelText = "計";
+  const String amountText = "￥" + String(totalSum);
 
-  M5.Display.setCursor(8, displayHeight - 54);
-  M5.Display.print("点数: ");
-  M5.Display.print(totalCount);
+  M5.Display.setFont(SUMMARY_FONT);
+  const int amountY = std::max(displayHeight - M5.Display.fontHeight() - SUMMARY_MARGIN_BOTTOM, 0);
+  const int amountHeight = M5.Display.fontHeight();
 
-  M5.Display.setCursor(8, displayHeight - 26);
-  M5.Display.print("合計: ");
-  M5.Display.print(totalSum);
-  M5.Display.print("円");
+  M5.Display.setFont(BODY_FONT);
+  const int labelHeight = M5.Display.fontHeight();
+  const int labelY = std::max(amountY + std::max(amountHeight - labelHeight, 0) - 5, 0);
+  M5.Display.setCursor(8, labelY);
+  M5.Display.print(labelText);
+  const int amountX = 8 + M5.Display.textWidth(labelText) + 8;
+
+  M5.Display.setFont(SUMMARY_FONT);
+  M5.Display.setCursor(amountX, amountY);
+  M5.Display.print(amountText);
 }
 
 /**
@@ -275,6 +496,7 @@ void renderThankYouScreen() {
   const int centerY = M5.Display.height() / 2;
 
   M5.Display.fillScreen(TFT_WHITE);
+  M5.Display.setFont(BODY_FONT);
   M5.Display.setTextColor(TFT_BLACK, TFT_WHITE);
   drawCenteredText("お買いあげ", centerY - 24);
   drawCenteredText("ありがとうございます", centerY + 8);
@@ -301,13 +523,23 @@ void handleBarcodeCode(const String& rawCode) {
   String code = rawCode;
   code.trim();
   if (code.length() < 2) {
+    ++barcodeShortFrameCount;
+    if (barcodeShortFrameCount >= BARCODE_SHORT_FRAME_RETRY_THRESHOLD) {
+      barcodeShortFrameCount = 0;
+      rotateBarcodeBaud();
+    }
     return;
   }
 
+  barcodeShortFrameCount = 0;
+  logDebug("[BC] code=" + code);
   playScanTone();
 
   const Item item = resolveItemFromCode(code);
   cart.push_back(item);
+  while (static_cast<int>(cart.size()) > ITEM_VISIBLE_ROWS) {
+    cart.erase(cart.begin());
+  }
   renderNormalScreen();
 }
 
@@ -327,6 +559,8 @@ void handleRfidUid(const String& rawUid) {
     return;
   }
 
+  logDebug("[RFID] uid=" + uid);
+
   // ありがとう表示を先に確定
   cart.clear();
   appState = AppState::THANK_YOU;
@@ -338,17 +572,42 @@ void handleRfidUid(const String& rawUid) {
 }
 
 /**
- * ストリームから改行区切りで1行読み取ります。
+ * RFIDカードのUIDを16進文字列へ変換します。
  */
-bool readLine(Stream& stream, String& buffer, String& lineOut) {
+String getRfidUidHex() {
+  String uid;
+
+  for (byte index = 0; index < rfidReader.uid.size; ++index) {
+    const uint8_t value = rfidReader.uid.uidByte[index];
+    if (value < 0x10) {
+      uid += "0";
+    }
+    uid += String(value, HEX);
+  }
+
+  uid.toUpperCase();
+  return uid;
+}
+
+/**
+ * ストリームから1フレームを読み取ります。
+ * ※改行終端または無通信時間経過で1フレームを確定します。
+ */
+bool readFrame(
+  Stream& stream,
+  String& buffer,
+  String& lineOut,
+  uint32_t& lastByteAtMs,
+  const uint32_t frameGapMs
+) {
   while (stream.available() > 0) {
     const char ch = static_cast<char>(stream.read());
+    lastByteAtMs = millis();
 
-    if (ch == '\r') {
-      continue;
-    }
-
-    if (ch == '\n') {
+    if (ch == '\r' || ch == '\n') {
+      if (buffer.isEmpty()) {
+        continue;
+      }
       lineOut = buffer;
       buffer = "";
       return true;
@@ -363,6 +622,12 @@ bool readLine(Stream& stream, String& buffer, String& lineOut) {
     }
   }
 
+  if (frameGapMs > 0 && !buffer.isEmpty() && millis() - lastByteAtMs >= frameGapMs) {
+    lineOut = buffer;
+    buffer = "";
+    return true;
+  }
+
   return false;
 }
 
@@ -370,20 +635,58 @@ bool readLine(Stream& stream, String& buffer, String& lineOut) {
  * UART経由のバーコード入力を処理します。
  */
 void pollBarcodeSerial() {
-  String line;
-  while (readLine(barcodeSerial, barcodeBuffer, line)) {
+  if (barcodeSerial.available() > 0 && !barcodeUartLocked) {
+    barcodeUartLocked = true;
+  }
+
+  while (barcodeSerial.available() > 0) {
+    const uint8_t raw = static_cast<uint8_t>(barcodeSerial.read());
+    barcodeLastByteAtMs = millis();
+
+    if (raw == '\r' || raw == '\n') {
+      if (barcodeBuffer.isEmpty()) {
+        continue;
+      }
+
+      const String line = barcodeBuffer;
+      barcodeBuffer = "";
+      handleBarcodeCode(line);
+      continue;
+    }
+
+    if (raw >= 0x20 && raw <= 0x7E) {
+      barcodeBuffer += static_cast<char>(raw);
+      if (barcodeBuffer.length() > 128) {
+        barcodeBuffer.remove(0, barcodeBuffer.length() - 128);
+      }
+    }
+  }
+
+  if (!barcodeBuffer.isEmpty() && millis() - barcodeLastByteAtMs >= BARCODE_FRAME_GAP_MS) {
+    const String line = barcodeBuffer;
+    barcodeBuffer = "";
     handleBarcodeCode(line);
   }
+
+  probeBarcodeSerialWhenSilent();
 }
 
 /**
- * UART経由のRFID入力を処理します。
+ * RFIDカード入力を処理します。
  */
-void pollRfidSerial() {
-  String line;
-  while (readLine(rfidSerial, rfidBuffer, line)) {
-    handleRfidUid(line);
+void pollRfidCard() {
+  if (!rfidReader.PICC_IsNewCardPresent()) {
+    return;
   }
+
+  if (!rfidReader.PICC_ReadCardSerial()) {
+    return;
+  }
+
+  const String uid = getRfidUidHex();
+  handleRfidUid(uid);
+  rfidReader.PICC_HaltA();
+  rfidReader.PCD_StopCrypto1();
 }
 
 /**
@@ -391,7 +694,7 @@ void pollRfidSerial() {
  */
 void pollDebugSerial() {
   String line;
-  while (readLine(Serial, debugBuffer, line)) {
+  while (readFrame(Serial, debugBuffer, line, debugLastByteAtMs, DEBUG_FRAME_GAP_MS)) {
     line.trim();
     if (line.startsWith("BC:")) {
       handleBarcodeCode(line.substring(3));
@@ -412,12 +715,14 @@ void pollClearButton() {
   int32_t touchX = 0;
   int32_t touchY = 0;
   const bool isTouching = M5.Display.getTouch(&touchX, &touchY);
+  const Rect clearButtonHitRect = getClearButtonHitRect();
 
   if (appState == AppState::NORMAL && isTouching && !wasTouching) {
-    const bool inClearButton = touchX >= CLEAR_BUTTON_X && touchX <= CLEAR_BUTTON_X + CLEAR_BUTTON_W
-      && touchY >= CLEAR_BUTTON_Y && touchY <= CLEAR_BUTTON_Y + CLEAR_BUTTON_H;
+    const bool inClearButton = touchX >= clearButtonHitRect.x && touchX < clearButtonHitRect.x + clearButtonHitRect.w
+      && touchY >= clearButtonHitRect.y && touchY < clearButtonHitRect.y + clearButtonHitRect.h;
 
     if (inClearButton) {
+      playScanTone();
       clearCart();
     }
   }
@@ -450,13 +755,30 @@ void setup() {
   auto config = M5.config();
   M5.begin(config);
 
+  barcodePortcRxdPin = M5.getPin(m5::pin_name_t::port_c_rxd);
+  barcodePortcTxdPin = M5.getPin(m5::pin_name_t::port_c_txd);
+  const int rfidSclPin = M5.getPin(m5::pin_name_t::port_a_scl);
+  const int rfidSdaPin = M5.getPin(m5::pin_name_t::port_a_sda);
+
+  const size_t initialConfigIndex = BARCODE_START_WITH_SWAPPED_LINES ? getBarcodeBaudCount() : 0;
+  applyBarcodeSerialConfig(initialConfigIndex);
+
   Serial.begin(115200);
-  barcodeSerial.begin(BARCODE_BAUD, SERIAL_8N1, BARCODE_RX_PIN, BARCODE_TX_PIN);
-  rfidSerial.begin(RFID_BAUD, SERIAL_8N1, RFID_RX_PIN, RFID_TX_PIN);
+  beginBarcodeSerial(true);
+  barcodeLastProbeAtMs = millis();
+  Wire.begin(rfidSdaPin, rfidSclPin, RFID_I2C_CLOCK);
+  logRfidI2cStatus();
+  rfidReader.PCD_Init();
+  logRfidVersion();
+
+  logDebug("[BOOT] portc RXD pin=" + String(barcodePortcRxdPin) + " TXD pin=" + String(barcodePortcTxdPin));
+  logDebug("[BOOT] barcode swap start=" + String(BARCODE_START_WITH_SWAPPED_LINES ? 1 : 0));
+  logDebug("[BOOT] rfid I2C SDA=" + String(rfidSdaPin) + " SCL=" + String(rfidSclPin));
+  logDebug("[BOOT] rfid reset pin=" + String(RFID_RESET_DUMMY_PIN));
 
   M5.Speaker.setVolume(SPEAKER_VOLUME);
   M5.Display.setRotation(1);
-  M5.Display.setFont(&fonts::lgfxJapanGothic_16);
+  M5.Display.setFont(BODY_FONT);
   M5.Display.setTextSize(1);
 
   playStartupTone();
@@ -473,7 +795,7 @@ void loop() {
   pollClearButton();
   pollDebugSerial();
   pollBarcodeSerial();
-  pollRfidSerial();
+  pollRfidCard();
 
   // タイマー満了で通常状態へ復帰
   updateThankYouState();
