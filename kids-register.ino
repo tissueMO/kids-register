@@ -10,11 +10,13 @@
 namespace {
 
 // バーコードスキャナUART設定
-constexpr long BARCODE_BAUD_CANDIDATES[] = {9600, 115200, 19200, 38400, 57600};
-constexpr bool BARCODE_START_WITH_SWAPPED_LINES = false;
+constexpr long BARCODE_UART_BAUD = 115200;
 constexpr uint32_t BARCODE_FRAME_GAP_MS = 300;
-constexpr int BARCODE_SHORT_FRAME_RETRY_THRESHOLD = 5;
-constexpr uint32_t BARCODE_PROBE_INTERVAL_MS = 4000;
+constexpr uint32_t BARCODE_COMMAND_GUARD_MS = 120;
+constexpr uint32_t BARCODE_BOOT_STABILIZE_MS = 1500;
+constexpr uint8_t BARCODE_CMD_TRIGGER_MODE_BUTTON[] = {0x21, 0x61, 0x41, 0x00};
+constexpr uint8_t BARCODE_CMD_FILL_LIGHT_OFF[] = {0x21, 0x62, 0x41, 0x00};
+constexpr uint8_t BARCODE_CMD_AIM_LIGHT_ON[] = {0x21, 0x62, 0x42, 0x02};
 
 // RFIDリーダI2C設定
 constexpr uint8_t RFID_I2C_ADDRESS = 0x28;
@@ -47,8 +49,8 @@ constexpr int ITEM_TEXT_OFFSET_Y = 3;
 constexpr int ITEM_RULE_OFFSET_Y = 30;
 constexpr int SUMMARY_MARGIN_BOTTOM = 4;
 constexpr size_t FRAME_BUFFER_MAX_LENGTH = 128;
-constexpr size_t BARCODE_SERIAL_CONFIG_VARIANTS = 2;
 constexpr int MIN_VALID_INPUT_LENGTH = 2;
+constexpr int BARCODE_MIN_VALID_LENGTH = 6;
 constexpr long USB_SERIAL_BAUD = 115200;
 
 enum class AppState {
@@ -80,15 +82,10 @@ String barcodeBuffer;
 String debugBuffer;
 uint32_t barcodeLastByteAtMs = 0;
 uint32_t debugLastByteAtMs = 0;
-uint32_t barcodeLastProbeAtMs = 0;
 int barcodePortcRxdPin = -1;
 int barcodePortcTxdPin = -1;
-int barcodeRxPin = -1;
-int barcodeTxPin = -1;
-size_t barcodeBaudIndex = 0;
-size_t barcodeConfigIndex = 0;
-int barcodeShortFrameCount = 0;
-bool barcodeUartLocked = false;
+uint32_t barcodeCommandGuardUntilMs = 0;
+uint32_t barcodeInputReadyAtMs = 0;
 
 constexpr const lgfx::U8g2font* BODY_FONT = &fonts::lgfxJapanGothic_24;
 constexpr const lgfx::U8g2font* SUMMARY_FONT = &fonts::lgfxJapanGothic_32;
@@ -135,99 +132,72 @@ void logRfidVersion() {
 }
 
 /**
- * バーコードボーレート候補数を返します。
- */
-size_t getBarcodeBaudCount() {
-  return sizeof(BARCODE_BAUD_CANDIDATES) / sizeof(BARCODE_BAUD_CANDIDATES[0]);
-}
-
-/**
- * 現在の候補インデックスのボーレートを返します。
- */
-long getCurrentBarcodeBaud() {
-  return BARCODE_BAUD_CANDIDATES[barcodeBaudIndex];
-}
-
-/**
- * 現在設定が配線入れ替え状態かを返します。
- */
-bool isBarcodeSwapped() {
-  return barcodeRxPin == barcodePortcTxdPin && barcodeTxPin == barcodePortcRxdPin;
-}
-
-/**
- * 指定した設定インデックスをUART設定へ反映します。
- */
-void applyBarcodeSerialConfig(const size_t configIndex) {
-  const size_t baudCount = getBarcodeBaudCount();
-  const bool swapLines = configIndex >= baudCount;
-
-  barcodeConfigIndex = configIndex;
-  barcodeBaudIndex = configIndex % baudCount;
-  barcodeRxPin = swapLines ? barcodePortcTxdPin : barcodePortcRxdPin;
-  barcodeTxPin = swapLines ? barcodePortcRxdPin : barcodePortcTxdPin;
-}
-
-/**
- * バーコードUARTを現在設定で初期化します。
+ * バーコードUARTを初期化します。
  */
 void beginBarcodeSerial(const bool shouldLog) {
-  barcodeSerial.begin(getCurrentBarcodeBaud(), SERIAL_8N1, barcodeRxPin, barcodeTxPin);
+  barcodeSerial.begin(BARCODE_UART_BAUD, SERIAL_8N1, barcodePortcRxdPin, barcodePortcTxdPin);
 
   if (shouldLog) {
     logDebug(
-      "[BC] serial begin RX=" + String(barcodeRxPin)
-      + " TX=" + String(barcodeTxPin)
-      + " BAUD=" + String(getCurrentBarcodeBaud())
+      "[BC] serial begin RX=" + String(barcodePortcRxdPin)
+      + " TX=" + String(barcodePortcTxdPin)
+      + " BAUD=" + String(BARCODE_UART_BAUD)
     );
   }
 }
 
 /**
- * 現在設定でバーコードUARTを再初期化します。
+ * バーコードUART受信バッファを破棄します。
  */
-void reopenBarcodeSerial() {
-  barcodeSerial.end();
-  beginBarcodeSerial(false);
-}
-
-/**
- * バーコードUARTを次の候補ボーレートへ切り替えます。
- */
-void rotateBarcodeBaud() {
-  const size_t baudCount = getBarcodeBaudCount();
-  const size_t swapBaseIndex = isBarcodeSwapped() ? baudCount : 0;
-  const size_t nextConfigIndex = swapBaseIndex + (barcodeBaudIndex + 1) % baudCount;
-
-  applyBarcodeSerialConfig(nextConfigIndex);
-  reopenBarcodeSerial();
-}
-
-/**
- * バーコードUARTを次の配線/ボーレート候補へ切り替えます。
- */
-void rotateBarcodeSerialConfig() {
-  const size_t totalCount = getBarcodeBaudCount() * BARCODE_SERIAL_CONFIG_VARIANTS;
-  const size_t nextConfigIndex = (barcodeConfigIndex + 1) % totalCount;
-
-  applyBarcodeSerialConfig(nextConfigIndex);
-  reopenBarcodeSerial();
-}
-
-/**
- * 無受信時の探索として配線/ボーレート候補を巡回します。
- */
-void probeBarcodeSerialWhenSilent() {
-  if (barcodeUartLocked) {
-    return;
+void clearBarcodeSerialInput() {
+  while (barcodeSerial.available() > 0) {
+    static_cast<void>(barcodeSerial.read());
   }
 
-  if (millis() - barcodeLastProbeAtMs < BARCODE_PROBE_INTERVAL_MS) {
-    return;
-  }
+  barcodeBuffer = "";
+  barcodeLastByteAtMs = 0;
+}
 
-  barcodeLastProbeAtMs = millis();
-  rotateBarcodeSerialConfig();
+/**
+ * バーコードスキャナへコマンドを送信します。
+ */
+void sendBarcodeCommand(const uint8_t* command, const size_t length) {
+  clearBarcodeSerialInput();
+  barcodeSerial.write(command, length);
+  barcodeSerial.flush();
+  delay(BARCODE_COMMAND_GUARD_MS);
+  clearBarcodeSerialInput();
+  barcodeCommandGuardUntilMs = millis() + BARCODE_COMMAND_GUARD_MS;
+}
+
+/**
+ * バーコードスキャナを本体ボタントリガーモードに設定します。
+ */
+void setBarcodeButtonTriggerMode() {
+  sendBarcodeCommand(BARCODE_CMD_TRIGGER_MODE_BUTTON, sizeof(BARCODE_CMD_TRIGGER_MODE_BUTTON));
+}
+
+/**
+ * バーコードの補光LEDを常時消灯設定にします。
+ */
+void setBarcodeFillLightOff() {
+  sendBarcodeCommand(BARCODE_CMD_FILL_LIGHT_OFF, sizeof(BARCODE_CMD_FILL_LIGHT_OFF));
+}
+
+/**
+ * バーコードの照準LEDを作動時連続点灯設定にします。
+ */
+void setBarcodeAimLightOn() {
+  sendBarcodeCommand(BARCODE_CMD_AIM_LIGHT_ON, sizeof(BARCODE_CMD_AIM_LIGHT_ON));
+}
+
+/**
+ * バーコードスキャナの起動時設定を適用します。
+ */
+void applyBarcodeScannerSettings() {
+  setBarcodeButtonTriggerMode();
+  setBarcodeFillLightOff();
+  setBarcodeAimLightOn();
 }
 
 /**
@@ -392,6 +362,21 @@ bool tryNormalizeInput(const String& rawInput, String& normalizedInput) {
   normalizedInput = rawInput;
   normalizedInput.trim();
   return normalizedInput.length() >= MIN_VALID_INPUT_LENGTH;
+}
+
+/**
+ * バーコードスキャナの制御応答フレームかを判定します。
+ */
+bool isBarcodeControlResponse(const String& frame) {
+  if (frame == "3u") {
+    return true;
+  }
+
+  if (frame.length() <= 4 && (frame.startsWith("\"") || frame.startsWith("$"))) {
+    return true;
+  }
+
+  return false;
 }
 
 /**
@@ -586,17 +571,19 @@ void handleBarcodeCode(const String& rawCode) {
     return;
   }
 
-  String code;
-  if (!tryNormalizeInput(rawCode, code)) {
-    ++barcodeShortFrameCount;
-    if (barcodeShortFrameCount >= BARCODE_SHORT_FRAME_RETRY_THRESHOLD) {
-      barcodeShortFrameCount = 0;
-      rotateBarcodeBaud();
-    }
+  if (isBarcodeControlResponse(rawCode)) {
     return;
   }
 
-  barcodeShortFrameCount = 0;
+  String code;
+  if (!tryNormalizeInput(rawCode, code)) {
+    return;
+  }
+
+  if (code.length() < BARCODE_MIN_VALID_LENGTH) {
+    return;
+  }
+
   logDebug("[BC] code=" + code);
   playScanTone();
 
@@ -691,16 +678,20 @@ bool readFrame(
  * UART経由のバーコード入力を処理します。
  */
 void pollBarcodeSerial() {
-  if (barcodeSerial.available() > 0 && !barcodeUartLocked) {
-    barcodeUartLocked = true;
+  if (millis() < barcodeInputReadyAtMs) {
+    clearBarcodeSerialInput();
+    return;
+  }
+
+  if (millis() < barcodeCommandGuardUntilMs) {
+    clearBarcodeSerialInput();
+    return;
   }
 
   String line;
   while (readFrame(barcodeSerial, barcodeBuffer, line, barcodeLastByteAtMs, BARCODE_FRAME_GAP_MS)) {
     handleBarcodeCode(line);
   }
-
-  probeBarcodeSerialWhenSilent();
 }
 
 /**
@@ -800,10 +791,10 @@ void resolvePeripheralPins(int& rfidSdaPin, int& rfidSclPin) {
  * バーコードUARTを初期化します。
  */
 void initializeBarcodeSerial() {
-  const size_t initialConfigIndex = BARCODE_START_WITH_SWAPPED_LINES ? getBarcodeBaudCount() : 0;
-  applyBarcodeSerialConfig(initialConfigIndex);
   beginBarcodeSerial(true);
-  barcodeLastProbeAtMs = millis();
+  applyBarcodeScannerSettings();
+  barcodeInputReadyAtMs = millis() + BARCODE_BOOT_STABILIZE_MS;
+  clearBarcodeSerialInput();
 }
 
 /**
@@ -821,7 +812,8 @@ void initializeRfidReader(const int rfidSdaPin, const int rfidSclPin) {
  */
 void logBootConfiguration(const int rfidSdaPin, const int rfidSclPin) {
   logDebug("[BOOT] portc RXD pin=" + String(barcodePortcRxdPin) + " TXD pin=" + String(barcodePortcTxdPin));
-  logDebug("[BOOT] barcode swap start=" + String(BARCODE_START_WITH_SWAPPED_LINES ? 1 : 0));
+  logDebug("[BOOT] barcode BAUD=" + String(BARCODE_UART_BAUD));
+  logDebug("[BOOT] barcode trigger=unit button");
   logDebug("[BOOT] rfid I2C SDA=" + String(rfidSdaPin) + " SCL=" + String(rfidSclPin));
   logDebug("[BOOT] rfid reset pin=" + String(RFID_RESET_DUMMY_PIN));
 }
