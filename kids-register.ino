@@ -62,7 +62,7 @@ RegisterMode::Pins resolvePeripheralPins() {
  */
 void initializeUi() {
   M5.Speaker.setVolume(SPEAKER_VOLUME);
-  M5.Display.setRotation(1);
+  M5.Display.setRotation(3);
   M5.Display.setFont(BODY_FONT);
   M5.Display.setTextSize(1);
 }
