@@ -1,6 +1,7 @@
 #include <M5Unified.h>
 #include <MFRC522_I2C.h>
 #include <Wire.h>
+#include <esp_camera.h>
 
 #include <algorithm>
 #include <vector>
@@ -48,14 +49,34 @@ constexpr int ITEM_ROW_HEIGHT = 36;
 constexpr int ITEM_TEXT_OFFSET_Y = 3;
 constexpr int ITEM_RULE_OFFSET_Y = 30;
 constexpr int SUMMARY_MARGIN_BOTTOM = 4;
+constexpr int MODE_BUTTON_W = 146;
+constexpr int MODE_BUTTON_H = 164;
+constexpr int MODE_BUTTON_GAP = 16;
+constexpr int MODE_BUTTON_TOP = 56;
+constexpr int MODE_ICON_SIZE = 64;
+constexpr int MODE_LABEL_GAP_Y = 14;
+constexpr int MODE_TITLE_Y = 10;
+constexpr int STILL_FRAME_THICKNESS = 5;
+constexpr int STILL_FRAME_INNER_LINE_OFFSET = 8;
 constexpr size_t FRAME_BUFFER_MAX_LENGTH = 128;
 constexpr int MIN_VALID_INPUT_LENGTH = 2;
 constexpr int BARCODE_MIN_VALID_LENGTH = 6;
 constexpr long USB_SERIAL_BAUD = 115200;
 
+enum class AppMode {
+  SELECT,
+  REGISTER,
+  CAMERA,
+};
+
 enum class AppState {
   NORMAL,
   THANK_YOU,
+};
+
+enum class CameraViewState {
+  LIVE,
+  STILL,
 };
 
 struct Item {
@@ -74,7 +95,9 @@ HardwareSerial barcodeSerial(1);
 MFRC522_I2C rfidReader(RFID_I2C_ADDRESS, RFID_RESET_DUMMY_PIN, &Wire);
 
 std::vector<Item> cart;
+AppMode appMode = AppMode::SELECT;
 AppState appState = AppState::NORMAL;
+CameraViewState cameraViewState = CameraViewState::LIVE;
 uint32_t thankYouStartedAtMs = 0;
 bool wasTouching = false;
 
@@ -86,6 +109,11 @@ int barcodePortcRxdPin = -1;
 int barcodePortcTxdPin = -1;
 uint32_t barcodeCommandGuardUntilMs = 0;
 uint32_t barcodeInputReadyAtMs = 0;
+bool isCameraInitialized = false;
+bool isCameraReady = false;
+bool isRfidReady = false;
+
+camera_config_t cameraConfig = {};
 
 constexpr const lgfx::U8g2font* BODY_FONT = &fonts::lgfxJapanGothic_24;
 constexpr const lgfx::U8g2font* SUMMARY_FONT = &fonts::lgfxJapanGothic_32;
@@ -105,16 +133,17 @@ void logDebug(const String& message) {
 /**
  * RFIDリーダのI2C接続状態をログ出力します。
  */
-void logRfidI2cStatus() {
+bool checkRfidI2cStatus() {
   Wire.beginTransmission(RFID_I2C_ADDRESS);
   const uint8_t errorCode = Wire.endTransmission();
 
   if (errorCode == 0) {
     logDebug("[RFID] I2C address 0x28 detected");
-    return;
+    return true;
   }
 
   logDebug("[RFID] I2C address 0x28 not found, error=" + String(errorCode));
+  return false;
 }
 
 /**
@@ -198,6 +227,122 @@ void applyBarcodeScannerSettings() {
   setBarcodeButtonTriggerMode();
   setBarcodeFillLightOff();
   setBarcodeAimLightOn();
+}
+
+/**
+ * カメラ設定を初期化します。
+ */
+void initializeCameraConfig(const bool useCompactProfile) {
+  cameraConfig.pin_pwdn = -1;
+  cameraConfig.pin_reset = -1;
+  cameraConfig.pin_xclk = -1;
+  cameraConfig.pin_sscb_sda = 12;
+  cameraConfig.pin_sscb_scl = 11;
+  cameraConfig.pin_d7 = 47;
+  cameraConfig.pin_d6 = 48;
+  cameraConfig.pin_d5 = 16;
+  cameraConfig.pin_d4 = 15;
+  cameraConfig.pin_d3 = 42;
+  cameraConfig.pin_d2 = 41;
+  cameraConfig.pin_d1 = 40;
+  cameraConfig.pin_d0 = 39;
+  cameraConfig.pin_vsync = 46;
+  cameraConfig.pin_href = 38;
+  cameraConfig.pin_pclk = 45;
+  cameraConfig.xclk_freq_hz = 20000000;
+  cameraConfig.ledc_timer = LEDC_TIMER_0;
+  cameraConfig.ledc_channel = LEDC_CHANNEL_0;
+  cameraConfig.pixel_format = PIXFORMAT_RGB565;
+  cameraConfig.frame_size = FRAMESIZE_QVGA;
+  cameraConfig.jpeg_quality = 0;
+  cameraConfig.fb_count = useCompactProfile ? 1 : 2;
+  cameraConfig.fb_location = useCompactProfile ? CAMERA_FB_IN_DRAM : CAMERA_FB_IN_PSRAM;
+  cameraConfig.grab_mode = CAMERA_GRAB_LATEST;
+  cameraConfig.sccb_i2c_port = -1;
+}
+
+/**
+ * カメラモジュールを初期化し、利用可否を返します。
+ */
+bool initializeCameraModule() {
+  if (isCameraReady) {
+    return true;
+  }
+
+  if (isCameraInitialized) {
+    esp_camera_deinit();
+    isCameraInitialized = false;
+  }
+
+  initializeCameraConfig(false);
+  M5.In_I2C.release();
+  esp_err_t result = esp_camera_init(&cameraConfig);
+  if (result == ESP_OK) {
+    isCameraInitialized = true;
+    isCameraReady = true;
+    logDebug("[CAM] init ok profile=normal");
+    return true;
+  }
+
+  logDebug("[CAM] init failed profile=normal err=" + String(static_cast<int>(result)));
+  esp_camera_deinit();
+  delay(20);
+
+  initializeCameraConfig(true);
+  result = esp_camera_init(&cameraConfig);
+  if (result != ESP_OK) {
+    logDebug("[CAM] init failed profile=compact err=" + String(static_cast<int>(result)));
+    isCameraInitialized = false;
+    isCameraReady = false;
+    return false;
+  }
+
+  isCameraInitialized = true;
+  isCameraReady = true;
+  logDebug("[CAM] init ok profile=compact");
+  return true;
+}
+
+/**
+ * カメラフレームを1枚取得します。
+ */
+bool captureCameraFrame(camera_fb_t*& frame) {
+  frame = esp_camera_fb_get();
+  return frame != nullptr;
+}
+
+/**
+ * 取得済みカメラフレームを解放します。
+ */
+void releaseCameraFrame(camera_fb_t*& frame) {
+  if (frame == nullptr) {
+    return;
+  }
+
+  esp_camera_fb_return(frame);
+  frame = nullptr;
+}
+
+/**
+ * おうちレジボタンの表示領域を返します。
+ */
+Rect getRegisterModeButtonRect() {
+  const int totalWidth = MODE_BUTTON_W * 2 + MODE_BUTTON_GAP;
+  const int startX = (M5.Display.width() - totalWidth) / 2;
+  return Rect{startX, MODE_BUTTON_TOP, MODE_BUTTON_W, MODE_BUTTON_H};
+}
+
+/**
+ * カメラボタンの表示領域を返します。
+ */
+Rect getCameraModeButtonRect() {
+  const Rect registerButtonRect = getRegisterModeButtonRect();
+  return Rect{
+    registerButtonRect.x + registerButtonRect.w + MODE_BUTTON_GAP,
+    registerButtonRect.y,
+    registerButtonRect.w,
+    registerButtonRect.h,
+  };
 }
 
 /**
@@ -345,6 +490,13 @@ void playStartupTone() {
 }
 
 /**
+ * シャッター音を鳴らします。
+ */
+void playShutterTone() {
+  playToneSteps(SHUTTER_TONE_STEPS);
+}
+
+/**
  * フレームバッファを上限長まで切り詰めます。
  */
 void trimFrameBuffer(String& buffer) {
@@ -458,6 +610,75 @@ void drawClearButton(const Rect& clearButtonRect) {
 }
 
 /**
+ * おうちレジのアイコンを描画します。
+ */
+void drawRegisterModeIcon(const Rect& iconRect) {
+  const int roofTopY = iconRect.y + 4;
+  const int roofBottomY = iconRect.y + 26;
+  const int roofLeftX = iconRect.x + 6;
+  const int roofRightX = iconRect.x + iconRect.w - 6;
+  const int bodyX = iconRect.x + 12;
+  const int bodyY = roofBottomY;
+  const int bodyW = iconRect.w - 24;
+  const int bodyH = iconRect.h - 30;
+
+  M5.Display.fillTriangle(
+    roofLeftX,
+    roofBottomY,
+    iconRect.x + iconRect.w / 2,
+    roofTopY,
+    roofRightX,
+    roofBottomY,
+    TFT_DARKGREEN
+  );
+  M5.Display.fillRect(bodyX, bodyY, bodyW, bodyH, TFT_DARKGREEN);
+  M5.Display.fillRect(iconRect.x + iconRect.w / 2 - 8, bodyY + 14, 16, bodyH - 16, TFT_WHITE);
+  M5.Display.fillRect(bodyX + 8, bodyY + 10, bodyW - 16, 12, TFT_WHITE);
+}
+
+/**
+ * カメラのアイコンを描画します。
+ */
+void drawCameraModeIcon(const Rect& iconRect) {
+  const int bodyX = iconRect.x + 6;
+  const int bodyY = iconRect.y + 18;
+  const int bodyW = iconRect.w - 12;
+  const int bodyH = iconRect.h - 24;
+
+  M5.Display.fillRoundRect(bodyX, bodyY, bodyW, bodyH, 10, TFT_NAVY);
+  M5.Display.fillRoundRect(bodyX + 14, iconRect.y + 6, bodyW - 28, 16, 5, TFT_NAVY);
+  M5.Display.fillCircle(iconRect.x + iconRect.w / 2, bodyY + bodyH / 2, 17, TFT_WHITE);
+  M5.Display.fillCircle(iconRect.x + iconRect.w / 2, bodyY + bodyH / 2, 8, TFT_NAVY);
+}
+
+/**
+ * モード選択ボタンの共通枠を描画します。
+ */
+void drawModeButtonFrame(const Rect& buttonRect, const String& label) {
+  M5.Display.fillRoundRect(buttonRect.x, buttonRect.y, buttonRect.w, buttonRect.h, 10, TFT_WHITE);
+  M5.Display.drawRoundRect(buttonRect.x, buttonRect.y, buttonRect.w, buttonRect.h, 10, TFT_DARKGREY);
+
+  const Rect iconRect{
+    buttonRect.x + (buttonRect.w - MODE_ICON_SIZE) / 2,
+    buttonRect.y + 16,
+    MODE_ICON_SIZE,
+    MODE_ICON_SIZE,
+  };
+
+  if (label == "おうちレジ") {
+    drawRegisterModeIcon(iconRect);
+  } else {
+    drawCameraModeIcon(iconRect);
+  }
+
+  M5.Display.setCursor(
+    buttonRect.x + (buttonRect.w - M5.Display.textWidth(label)) / 2,
+    iconRect.y + iconRect.h + MODE_LABEL_GAP_Y
+  );
+  M5.Display.print(label);
+}
+
+/**
  * 明細の罫線を描画します。
  */
 void drawItemRules(const int displayWidth) {
@@ -556,6 +777,101 @@ void renderThankYouScreen() {
 }
 
 /**
+ * 起動モード選択画面を描画します。
+ */
+void renderModeSelectionScreen() {
+  const Rect registerButtonRect = getRegisterModeButtonRect();
+  const Rect cameraButtonRect = getCameraModeButtonRect();
+
+  M5.Display.fillScreen(TFT_WHITE);
+  M5.Display.setFont(BODY_FONT);
+  M5.Display.setTextColor(TFT_BLACK, TFT_WHITE);
+  drawCenteredText("モードを選ぶ", MODE_TITLE_Y + 8);
+
+  drawModeButtonFrame(registerButtonRect, "おうちレジ");
+  drawModeButtonFrame(cameraButtonRect, "カメラ");
+}
+
+/**
+ * カメラ未利用時の画面を描画します。
+ */
+void renderCameraUnavailableScreen() {
+  M5.Display.fillScreen(TFT_BLACK);
+  M5.Display.setFont(BODY_FONT);
+  M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+  drawCenteredText("カメラを", 82);
+  drawCenteredText("つかえません", 118);
+  drawCenteredText("タップでさいしこう", 168);
+}
+
+/**
+ * カメラフレームを画面へ描画します。
+ */
+void renderCameraFrame(const camera_fb_t* frame) {
+  if (frame == nullptr) {
+    return;
+  }
+
+  if (frame->width != M5.Display.width() || frame->height != M5.Display.height()) {
+    M5.Display.fillScreen(TFT_BLACK);
+  }
+
+  const int drawX = (M5.Display.width() - frame->width) / 2;
+  const int drawY = (M5.Display.height() - frame->height) / 2;
+  M5.Display.pushImage(
+    std::max(drawX, 0),
+    std::max(drawY, 0),
+    frame->width,
+    frame->height,
+    reinterpret_cast<const uint16_t*>(frame->buf)
+  );
+}
+
+/**
+ * 静止画の外枠を描画します。
+ */
+void drawStillPhotoFrame() {
+  const int width = M5.Display.width();
+  const int height = M5.Display.height();
+  const int innerX = STILL_FRAME_THICKNESS;
+  const int innerY = STILL_FRAME_THICKNESS;
+  const int innerW = std::max(width - STILL_FRAME_THICKNESS * 2, 1);
+  const int innerH = std::max(height - STILL_FRAME_THICKNESS * 2, 1);
+  const int lineOffset = std::min(STILL_FRAME_INNER_LINE_OFFSET, STILL_FRAME_THICKNESS + 4);
+  const int lineX = lineOffset;
+  const int lineY = lineOffset;
+  const int lineW = std::max(width - lineOffset * 2, 1);
+  const int lineH = std::max(height - lineOffset * 2, 1);
+
+  M5.Display.fillRect(0, 0, width, STILL_FRAME_THICKNESS, TFT_WHITE);
+  M5.Display.fillRect(0, height - STILL_FRAME_THICKNESS, width, STILL_FRAME_THICKNESS, TFT_WHITE);
+  M5.Display.fillRect(0, STILL_FRAME_THICKNESS, STILL_FRAME_THICKNESS, innerH, TFT_WHITE);
+  M5.Display.fillRect(width - STILL_FRAME_THICKNESS, STILL_FRAME_THICKNESS, STILL_FRAME_THICKNESS, innerH, TFT_WHITE);
+  M5.Display.drawRect(innerX, innerY, innerW, innerH, TFT_LIGHTGREY);
+  M5.Display.drawRect(lineX, lineY, lineW, lineH, TFT_DARKGREY);
+}
+
+/**
+ * ライブカメラ表示を更新します。
+ */
+void updateCameraLiveScreen() {
+  if (!isCameraReady) {
+    return;
+  }
+
+  camera_fb_t* frame = nullptr;
+  if (!captureCameraFrame(frame)) {
+    logDebug("[CAM] capture failed");
+    isCameraReady = false;
+    renderCameraUnavailableScreen();
+    return;
+  }
+
+  renderCameraFrame(frame);
+  releaseCameraFrame(frame);
+}
+
+/**
  * カートを空にして通常画面を更新します。
  */
 void clearCart() {
@@ -567,7 +883,7 @@ void clearCart() {
  * バーコード文字列を処理します。
  */
 void handleBarcodeCode(const String& rawCode) {
-  if (appState != AppState::NORMAL) {
+  if (appMode != AppMode::REGISTER || appState != AppState::NORMAL) {
     return;
   }
 
@@ -597,7 +913,7 @@ void handleBarcodeCode(const String& rawCode) {
  * RFID UID文字列を処理します。
  */
 void handleRfidUid(const String& rawUid) {
-  if (appState != AppState::NORMAL) {
+  if (appMode != AppMode::REGISTER || appState != AppState::NORMAL) {
     return;
   }
 
@@ -698,6 +1014,10 @@ void pollBarcodeSerial() {
  * RFIDカード入力を処理します。
  */
 void pollRfidCard() {
+  if (!isRfidReady) {
+    return;
+  }
+
   if (!rfidReader.PICC_IsNewCardPresent()) {
     return;
   }
@@ -741,21 +1061,105 @@ void pollDebugSerial() {
 }
 
 /**
- * タッチ操作でCLEAR押下を検知します。
+ * おうちレジモードへ切り替えます。
  */
-void pollClearButton() {
+void switchToRegisterMode() {
+  appMode = AppMode::REGISTER;
+  appState = AppState::NORMAL;
+  cameraViewState = CameraViewState::LIVE;
+  wasTouching = false;
+  renderNormalScreen();
+}
+
+/**
+ * カメラモードへ切り替えます。
+ */
+void switchToCameraMode() {
+  appMode = AppMode::CAMERA;
+  appState = AppState::NORMAL;
+  cameraViewState = CameraViewState::LIVE;
+  wasTouching = false;
+
+  if (!initializeCameraModule()) {
+    renderCameraUnavailableScreen();
+    return;
+  }
+
+  updateCameraLiveScreen();
+}
+
+/**
+ * 起動モード選択画面のタップを処理します。
+ */
+void handleModeSelectionTouch(const int touchX, const int touchY) {
+  if (isPointInsideRect(touchX, touchY, getRegisterModeButtonRect())) {
+    playStartupTone();
+    switchToRegisterMode();
+    return;
+  }
+
+  if (isPointInsideRect(touchX, touchY, getCameraModeButtonRect())) {
+    playStartupTone();
+    switchToCameraMode();
+  }
+}
+
+/**
+ * おうちレジ画面のタップを処理します。
+ */
+void handleRegisterTouch(const int touchX, const int touchY) {
+  if (appState != AppState::NORMAL) {
+    return;
+  }
+
+  const Rect clearButtonHitRect = getClearButtonHitRect();
+  if (!isPointInsideRect(touchX, touchY, clearButtonHitRect)) {
+    return;
+  }
+
+  playScanTone();
+  clearCart();
+}
+
+/**
+ * カメラ画面のタップを処理します。
+ */
+void handleCameraTouch() {
+  if (!isCameraReady) {
+    switchToCameraMode();
+    return;
+  }
+
+  if (cameraViewState == CameraViewState::LIVE) {
+    playShutterTone();
+    cameraViewState = CameraViewState::STILL;
+    drawStillPhotoFrame();
+    return;
+  }
+
+  cameraViewState = CameraViewState::LIVE;
+  updateCameraLiveScreen();
+}
+
+/**
+ * タッチ入力をモードごとに処理します。
+ */
+void pollTouchInput() {
   int32_t touchX = 0;
   int32_t touchY = 0;
   const bool isTouching = M5.Display.getTouch(&touchX, &touchY);
-  const Rect clearButtonHitRect = getClearButtonHitRect();
 
-  if (appState == AppState::NORMAL && isTouching && !wasTouching) {
-    const bool inClearButton = isPointInsideRect(touchX, touchY, clearButtonHitRect);
+  if (!isTouching || wasTouching) {
+    wasTouching = isTouching;
+    return;
+  }
 
-    if (inClearButton) {
-      playScanTone();
-      clearCart();
-    }
+  if (appMode == AppMode::SELECT) {
+    handleModeSelectionTouch(touchX, touchY);
+  } else if (appMode == AppMode::REGISTER) {
+    handleRegisterTouch(touchX, touchY);
+  } else {
+    handleCameraTouch();
   }
 
   wasTouching = isTouching;
@@ -765,7 +1169,7 @@ void pollClearButton() {
  * ありがとう画面の終了タイマーを処理します。
  */
 void updateThankYouState() {
-  if (appState != AppState::THANK_YOU) {
+  if (appMode != AppMode::REGISTER || appState != AppState::THANK_YOU) {
     return;
   }
 
@@ -775,6 +1179,21 @@ void updateThankYouState() {
 
   appState = AppState::NORMAL;
   renderNormalScreen();
+}
+
+/**
+ * カメラモード中の描画更新を処理します。
+ */
+void updateCameraState() {
+  if (appMode != AppMode::CAMERA) {
+    return;
+  }
+
+  if (cameraViewState != CameraViewState::LIVE) {
+    return;
+  }
+
+  updateCameraLiveScreen();
 }
 
 /**
@@ -802,9 +1221,14 @@ void initializeBarcodeSerial() {
  */
 void initializeRfidReader(const int rfidSdaPin, const int rfidSclPin) {
   Wire.begin(rfidSdaPin, rfidSclPin, RFID_I2C_CLOCK);
-  logRfidI2cStatus();
+  if (!checkRfidI2cStatus()) {
+    isRfidReady = false;
+    return;
+  }
+
   rfidReader.PCD_Init();
   logRfidVersion();
+  isRfidReady = true;
 }
 
 /**
@@ -847,8 +1271,7 @@ void setup() {
   logBootConfiguration(rfidSdaPin, rfidSclPin);
   initializeUi();
 
-  playStartupTone();
-  renderNormalScreen();
+  renderModeSelectionScreen();
 }
 
 /**
@@ -857,12 +1280,17 @@ void setup() {
 void loop() {
   M5.update();
 
-  // 毎フレーム入力を先に取り込む
-  pollClearButton();
-  pollDebugSerial();
-  pollBarcodeSerial();
-  pollRfidCard();
+  // 入力は最初に取り込む
+  pollTouchInput();
 
-  // タイマー満了で通常状態へ復帰
-  updateThankYouState();
+  // おうちレジ側の入力と状態更新
+  if (appMode == AppMode::REGISTER) {
+    pollDebugSerial();
+    pollBarcodeSerial();
+    pollRfidCard();
+    updateThankYouState();
+  }
+
+  // カメラ側の描画更新
+  updateCameraState();
 }

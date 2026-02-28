@@ -56,6 +56,16 @@ static constexpr ToneStep STARTUP_TONE_STEPS[] = {
 };
 
 /**
+ * シャッター音のステップ定義です。
+ * ※末尾の{0,0,0}は終端判定に使うため必須です。
+ */
+static constexpr ToneStep SHUTTER_TONE_STEPS[] = {
+  {2600, 25, 10},
+  {1700, 55, 0},
+  {0, 0, 0},
+};
+
+/**
  * スピーカー音量です。
  */
 static constexpr uint8_t SPEAKER_VOLUME = 32;
